@@ -1,14 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Json;
 using System.Threading.Tasks;
-using CloudServiceGateway.Models;
+using CloudServiceGateway.Database;
+using CloudServiceGateway.Database.Entities;
 using Microsoft.AspNetCore.Http;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using MoreLinq;
+using Ocelot.Infrastructure.RequestData;
 using Ocelot.LoadBalancer.LoadBalancers;
 using Ocelot.Responses;
 using Ocelot.Values;
@@ -27,121 +27,130 @@ namespace CloudServiceGateway
             _serviceProvider = serviceProvider;
             _logger = serviceProvider.GetService<ILogger<CustomLoadBalancer>>();
         }
-            
-        public async Task<Response<ServiceHostAndPort>> Lease(HttpContext httpContext)
+
+        public async Task<Response<ServiceHostAndPort>> Lease(HttpContext context)
         {
-            var hosts = await _get();
-            var context = _serviceProvider.GetRequiredService<IHttpContextAccessor>().HttpContext;
-            
             // todo: consider using body lenght in job weight
             var bodyLength = context.Response.ContentLength;
 
-            var service = await Choose(hosts);
+            var dbContext = _serviceProvider.GetRequiredService<CsContext>();
+
+            var servers = dbContext.Servers.ToDictionary(x=>x, x=> new List<JobTask>());
+
+            foreach (var serverJobTask in dbContext.ServerJobTasks
+                .Where(x => !x.Task.EndTime.HasValue)
+                .Include(x => x.Server)
+                .Include(x => x.Task))
+            {
+                servers[serverJobTask.Server].Add(serverJobTask.Task);
+            }
             
-            //var service = hosts.First();
-            var hostAndPort = service.HostAndPort;
-
             
+            var server = await ChooseServer(servers) ?? dbContext.Servers.FirstOrDefault();
             
-
-
-            _logger.LogWarning($"in {hostAndPort.Scheme}://{hostAndPort.DownstreamHost}: {hostAndPort.DownstreamPort}");
-
-            var baseUri = new UriBuilder(hostAndPort.DownstreamHost);
+            var data = GetRequestId();
             
-            var path = httpContext.Request.Path.ToUriComponent();
+            var type = GetRequestType(context);
+            var task = new JobTask()
+            {
+                StartTime = DateTime.Now,
+                Type = type,
+                RequestId = data,
+            };
+            var link = new ServerJobTask
+            {
+                Task = task,
+                Server = server,
+            };
 
-            baseUri.Path = path;
-                
+            await dbContext.Tasks.AddAsync(task);
+            await dbContext.ServerJobTasks.AddAsync(link);
+            await dbContext.SaveChangesAsync();
+
+            await Task.Delay(5000);
+
+
+            var hostAndPort = new ServiceHostAndPort(server.Host, server.Port, server.Scheme);
+
+            var message = $"in {hostAndPort.Scheme}://{hostAndPort.DownstreamHost}: {hostAndPort.DownstreamPort}";
+            _logger.LogInformation(message);
+
+
             var result = new OkResponse<ServiceHostAndPort>(hostAndPort);
             return result;
         }
-        
-        private async Task<Service> Choose(List<Service> hosts)
+
+        private string GetRequestId()
         {
-            // fetch data from all hosts about their load
-            var statuses = await GetStatuses(hosts);
-
-            var service = ChooseInternal(statuses);
-
-            return service;
+            var requestScoped = _serviceProvider.GetRequiredService<IRequestScopedDataRepository>();
+            var data = requestScoped.Get<string>("RequestId").Data;
+            return data;
         }
 
-        private Service ChooseInternal(IReadOnlyCollection<ServerStatus> statuses)
+        private static TaskType GetRequestType(HttpContext context)
         {
-            return statuses.MaxBy(ComplexFormula).First().Service;
-        }
-
-        private int ComplexFormula(ServerStatus arg)
-        {
-            const int cpuMultiplier = 3;
-            const int ramMultiplier = 1;
-            const int storageMultiplier = 5;
-            const int taskCountMultiplier = 10;
-
-            return arg.LoadData.CpuUsage * cpuMultiplier +
-                   arg.LoadData.RamUsage * ramMultiplier +
-                   arg.LoadData.StorageUsage * storageMultiplier +
-                   arg.Tasks.Count * taskCountMultiplier +
-                   arg.Tasks.Sum(x => x.Weight);
-        }
-
-        private async Task<IReadOnlyCollection<ServerStatus>> GetStatuses(List<Service> hosts)
-        {
-            var httpClientFactory = _serviceProvider.GetRequiredService<IHttpClientFactory>();
-            var client = httpClientFactory.CreateClient();
-
-            var statuses = new List<ServerStatus>();
-            
-            foreach (var service in hosts)
+            if (context.Request.Path.Value.Contains("create"))
             {
-                var uriBuilder = new UriBuilder
-                {
-                    Host = service.HostAndPort.DownstreamHost,
-                    Port = service.HostAndPort.DownstreamPort,
-                    Scheme = service.HostAndPort.Scheme,
-                    Path = "/custom-health"
-                };
-
-                ServiceLoadData loadData;
-
-                try
-                {
-                    loadData = await client.GetFromJsonAsync<ServiceLoadData>(uriBuilder.Uri).ConfigureAwait(false);
-                }
-                catch (Exception e)
-                {
-                    var rand = new Random();
-                    loadData = new ServiceLoadData
-                    {
-                        CpuUsage = rand.Next(0, 100),
-                        RamUsage = rand.Next(0, 100),
-                        StorageUsage = rand.Next(0, 100),
-                    };
-                }
-
-                
-                
-                var serverStatus = new ServerStatus()
-                {
-                    Service = service,
-                    LoadData = loadData,
-                    Tasks = await LoadTasks(service),
-                };
-                statuses.Add(serverStatus);
+                return TaskType.Upload;
             }
 
-            return statuses;
+            if (context.Request.Path.Value.Contains("download"))
+            {
+                return TaskType.Download;
+            }
+
+            return TaskType.None;
         }
 
-        private Task<List<ServerTask>> LoadTasks(Service service)
+        private Task<Server> ChooseServer(Dictionary<Server, List<JobTask>> lookup)
         {
-            return Task.FromResult(new List<ServerTask>());
+            var server = ChooseInternal(lookup);
+
+            return Task.FromResult(server);
         }
+
+        private Server ChooseInternal(Dictionary<Server, List<JobTask>> lookup)
+        {
+            var orderedWeights = lookup
+                .Select(x => new {x.Key, Weight = x.Value.Sum(task => _taskDifficulties[task.Type])})
+                .OrderBy(x => x.Weight)
+                .ToList();
+
+            var chosen = orderedWeights.FirstOrDefault()?.Key;
+
+            return chosen;
+        }
+
+        private readonly Dictionary<TaskType, float> _taskDifficulties = new Dictionary<TaskType, float>()
+        {
+            {TaskType.None, .1f},
+            {TaskType.Download, .4f},
+            {TaskType.Upload, .4f},
+            {TaskType.Edit, .1f},
+        };
+
 
         public void Release(ServiceHostAndPort hostAndPort)
         {
-            _logger.LogWarning($"release: {hostAndPort.Scheme}://{hostAndPort.DownstreamHost}: {hostAndPort.DownstreamPort}" );
+            var dbContext = _serviceProvider.GetRequiredService<CsContext>();
+            var requestScoped = _serviceProvider.GetRequiredService<IRequestScopedDataRepository>();
+            var data = requestScoped.Get<string>("RequestId").Data;
+
+
+            var jobTask = dbContext
+                .ServerJobTasks
+                .Include(x => x.Task)
+                .Include(x => x.Server)
+                .FirstOrDefault(x => x.Task.RequestId == data);
+
+            if (jobTask != null)
+            {
+                jobTask.Task.EndTime = DateTime.Now;
+                dbContext.SaveChanges();
+            }
+
+            _logger.LogInformation(
+                $"release: {hostAndPort.Scheme}://{hostAndPort.DownstreamHost}: {hostAndPort.DownstreamPort}");
         }
     }
 }
